@@ -68,7 +68,7 @@ floods that channel.
 
 | Toggle | Catches | When to turn it off |
 |---|---|---|
-| `remoteLogger` | `:FireServer` / `:InvokeServer` with **full arguments** — the channel item-stealers and trade-scams use. | Rarely — this is the single most important toggle for MM2 / trade scams. |
+| `remoteLogger` | `:FireServer` / `:InvokeServer` with **full arguments** — the channel item-stealers and trade-scams use. Caught **both** as a method call *and* as a cached function (`local f = r.FireServer; f(r, …)`), so the common `__namecall`-dodge doesn't work. | Rarely — this is the single most important toggle for MM2 / trade scams. |
 | `httpLogger` | `request` / `http_request` / `game:HttpGet` / `HttpPost` and **WebSocket** connections — exfiltration + C2. | Rarely. |
 | `cryptLogger` | `base64encode/decode`, `crypt.encrypt/decrypt`, and `HttpService:JSONEncode` — captures **inputs and outputs**, so it reveals the real exfil payload (cookie, webhook, player data) even when the URL is obfuscated. | If the script uses base64 heavily for its *own* deobfuscation and floods the log. |
 | `reconLogger` | `getgc` / `filtergc` / `getreg` / `getrenv` / `getsenv` / `getrawmetatable` — memory scraping (hunting RemoteEvents & secrets) and anti-analysis re-hooking. | If you only care about the final sinks, not how it finds them. |
@@ -87,13 +87,14 @@ info), the **function**, details, and — where the executor supports it — the
 | Type | Meaning |
 |---|---|
 | `remote` | `FireServer` / `InvokeServer`. The args reveal *what* is sent, e.g. `{give="all", to="Attacker"}`. |
-| `http` | An outbound HTTP request. Tagged `[webhook]`, `[raw-ip]`, `[roblox-api]`, `[file-read]`, `[paste]`, etc. |
+| `http` | An outbound HTTP request (incl. `HttpService:RequestAsync`/`GetAsync`/`PostAsync`). Tagged `[webhook]`, `[proxied-webhook]` (Discord payload to a non-Discord host), `[encoded-payload]` (opaque blob), `[raw-ip]`, `[roblox-api]`, `[file-read]`, `[paste]`. Bodies flag cookie / HWID / **your own player name+id**. |
 | `websocket` | A WebSocket C2 connection. |
 | `crypt` / `encode` | base64 / crypt / `JSONEncode` in **and** out — the decoded or encoded payload. |
 | `danger` | A blocklisted service method — account-token theft, purchases, screenshots, browser-JS, MessageBus, … |
 | `fs` | A file / folder operation; `autoexec` writes are flagged high. |
 | `loadstring` | A decoded code layer being executed. |
 | `recon` | Memory / environment scraping. |
+| `anti-analysis` | The script is checking for, undoing, or dodging hooks — `restorefunction`, `getfunctionhash`, `setthreadidentity` (identity spoof), `cloneref`, `getconnections`. A red flag in itself. |
 | `clipboard` | A clipboard write. |
 | `persist` | `queue_on_teleport` persistence. |
 | `signal` | `fire*` automated in-game actions. |
