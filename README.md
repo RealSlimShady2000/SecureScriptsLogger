@@ -11,8 +11,14 @@ this script, streams its events into a live colour-coded feed, and gives a
 verdict. You can also use it standalone via the one-liner below.
 
 > **Defensive analysis only.** Every hook is `pcall`-guarded and falls back to the
-> original — it never breaks the game. Even so: **run unknown scripts on an alt
-> account**, ideally in a throwaway environment.
+> original — it never breaks the game itself.
+>
+> ⚠️ **Account safety.** This logger *hooks* Roblox/executor APIs, which a game's own
+> in-game anti-cheat can detect (e.g. via metamethod env-leak checks) and **kick or
+> ban** for. Live-streaming also contacts a local server, and any suspect script you
+> run may leak your IP. **Use a throwaway alt account + a VPN, ideally in a VM — never
+> your main.** (Note: this is about *in-game* anti-cheat, not Roblox's Hyperion/Byfron
+> anti-tamper, which concerns the executor itself, not the scripts you run.)
 
 ## Quick start
 
