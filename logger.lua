@@ -20,6 +20,7 @@ local CFG = (getgenv and getgenv().SS_LOGGER_CONFIG) or {}
 local MODE = CFG.mode or "gui"               -- "gui" | "console" | "both"
 local BLOCK_RPC = CFG.blockRPC ~= false      -- default true
 local ENDPOINT = CFG.endpoint or ""           -- "" disables streaming to the app
+local TOKEN = CFG.streamToken or ""           -- anti-spoof token for the local listener
 local TOGGLE_KEY = CFG.toggleKey or "RightShift"
 
 -- per-feature global toggles (all default ON)
@@ -107,7 +108,7 @@ local function streamEvent(ev)
       realRequest({
         Url = ENDPOINT,
         Method = "POST",
-        Headers = { ["Content-Type"] = "application/json" },
+        Headers = { ["Content-Type"] = "application/json", ["x-ss-token"] = TOKEN },
         Body = HttpService:JSONEncode(ev),
       })
     end)
