@@ -33,6 +33,22 @@ local F = {
   game        = CFG.gameLogger ~= false,
 }
 
+-- dangerous service methods executors block (Myriad blocklist) — flag by category
+local DANGER = {
+  AccountService = { cat = "account-token", m = { GetCredentialsHeaders = 1, GetDeviceAccessToken = 1, GetDeviceIntegrityToken = 1, GetDeviceIntegrityTokenYield = 1 } },
+  MarketplaceService = { cat = "purchase", m = { GetRobuxBalance = 1, PerformPurchase = 1, PromptRobloxPurchase = 1, PromptBulkPurchase = 1, PerformBulkPurchase = 1 } },
+  BrowserService = { cat = "browser-js", m = { ExecuteJavaScript = 1, OpenBrowserWindow = 1, SendCommand = 1, OpenWeChatAuthWindow = 1 } },
+  LinkingService = { cat = "open-url", m = { OpenUrl = 1, RegisterLuaUrl = 1 } },
+  HttpRbxApiService = { cat = "roblox-api", m = { PostAsync = 1, GetAsync = 1, RequestAsync = 1, PostAsyncFullUrl = 1, GetAsyncFullUrl = 1 } },
+  OpenCloudService = { cat = "roblox-api", m = { HttpRequestAsync = 1 } },
+  CaptureService = { cat = "screenshot", m = { CaptureScreenshot = 1, SaveScreenshotCapture = 1, SaveCaptureToExternalStorage = 1 } },
+  CoreGui = { cat = "screenshot", m = { TakeScreenshot = 1, ToggleRecording = 1 } },
+  MessageBusService = { cat = "messagebus", m = { Call = 1, Publish = 1, MakeRequest = 1 } },
+  InsertService = { cat = "local-file", m = { GetLocalFileContents = 1 } },
+  ContentProvider = { cat = "asset-mitm", m = { SetBaseUrl = 1 } },
+  ScriptContext = { cat = "core-inject", m = { AddCoreScriptLocal = 1 } },
+}
+
 -- ---- capture originals (before anything is hooked) ----
 local ok_services, Players, HttpService, UserInput = pcall(function()
   return game:GetService("Players"), game:GetService("HttpService"), game:GetService("UserInputService")
@@ -68,6 +84,8 @@ local function classify(text)
   if string.match(text, "https?://%d+%.%d+%.%d+%.%d+") then return "raw-ip", "high" end
   if string.find(low, "%.workers%.dev") then return "cloudflare-worker", "high" end
   if string.find(low, "pastefy") or string.find(low, "pastebin") or string.find(low, "hastebin") or string.find(low, "raw.githubusercontent") then return "paste", "med" end
+  if string.find(low, "file://") then return "file-read", "high" end
+  if string.find(low, "%.roblox%.com") and (string.find(low, "economy") or string.find(low, "apis%.") or string.find(low, "accountsettings") or string.find(low, "auth%.roblox") or string.find(low, "/currency")) then return "roblox-api", "high" end
   return nil
 end
 local function bodyFlags(s)
@@ -296,6 +314,12 @@ if realHookMeta and realNamecall then
     if ok and not busy and realCheckCaller() then
       local args = { ... }
       pcall(function()
+        local cls
+        pcall(function() cls = self.ClassName end)
+        local dm = cls and DANGER[cls]
+        if dm and dm.m[method] then
+          emit("danger", "high", cls .. ":" .. method, "blocklisted method (" .. dm.cat .. ")", { category = dm.cat })
+        end
         local path = self.GetFullName and self:GetFullName() or tostring(self)
         if (method == "FireServer" or method == "fireServer") and F.remotes then
           emit("remote", "high", "FireServer", path .. "(" .. summarizeArgs(args) .. ")", { path = path, args = summarizeArgs(args) })
