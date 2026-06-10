@@ -14,9 +14,15 @@
 ============================================================================]]--
 
 if getgenv and getgenv().__SS_LOGGER_ACTIVE then return end
-if getgenv then getgenv().__SS_LOGGER_ACTIVE = true end
 
 local CFG = (getgenv and getgenv().SS_LOGGER_CONFIG) or {}
+-- Stealth: lift config into locals, then scrub it from getgenv so a script that
+-- reads getgenv() can't see SS_LOGGER_CONFIG (endpoint / toggles) or our presence.
+if getgenv then
+  getgenv().__SS_LOGGER_ACTIVE = true
+  pcall(function() getgenv().SS_LOGGER_CONFIG = nil end)
+end
+
 local MODE = CFG.mode or "gui"               -- "gui" | "console" | "both"
 local BLOCK_RPC = CFG.blockRPC ~= false      -- default true
 local ENDPOINT = CFG.endpoint or ""           -- "" disables streaming to the app
@@ -32,6 +38,8 @@ local F = {
   clipboard   = CFG.clipboardLogger ~= false,
   persist     = CFG.persistLogger ~= false,
   game        = CFG.gameLogger ~= false,
+  recon       = CFG.reconLogger ~= false,
+  crypt       = CFG.cryptLogger ~= false,
 }
 
 -- dangerous service methods executors block (Myriad blocklist) — flag by category
@@ -67,6 +75,20 @@ local realLoadstring = loadstring or load
 local realSetClipboard = setclipboard or toclipboard or (syn and syn.write_clipboard)
 local realQueueTeleport = queue_on_teleport or queueonteleport or (syn and syn.queue_on_teleport)
 local realIdentify = identifyexecutor or getexecutorname
+-- memory scraping / reflection (recon)
+local realGetgc, realFiltergc, realGetreg = getgc, filtergc, getreg
+local realGetrenv, realGetsenv, realGetRawMeta = getrenv, getsenv, getrawmetatable
+-- signal firing (global executor funcs, distinct from the namecall variants)
+local realFireProx, realFireClick, realFireTouch, realFireSignal =
+  fireproximityprompt, fireclickdetector, firetouchinterest, firesignal
+-- encoding / crypt (exfil prep — capturing in/out reveals the payload)
+local realB64enc = (crypt and crypt.base64encode) or base64encode or (base64 and base64.encode) or (syn and syn.crypt and syn.crypt.base64encode)
+local realB64dec = (crypt and crypt.base64decode) or base64decode or (base64 and base64.decode) or (syn and syn.crypt and syn.crypt.base64decode)
+local realCryptEnc, realCryptDec = (crypt and crypt.encrypt), (crypt and crypt.decrypt)
+local realWebSocket = (WebSocket and WebSocket.connect) or (websocket and websocket.connect)
+-- caller attribution
+local realDebugInfo = debug and debug.info
+local realGetCallingScript = getcallingscript
 
 local busy = false        -- reentrancy guard so the logger never logs itself
 local seq = 0
@@ -146,13 +168,18 @@ end
 local function buildGui()
   local okGui, api = pcall(function()
     local sg = Instance.new("ScreenGui")
-    sg.Name = "\0"
+    sg.Name = (HttpService and HttpService.GenerateGUID) and HttpService:GenerateGUID(false) or "\0"
     sg.ResetOnSpawn = false
     sg.IgnoreGuiInset = true
     sg.DisplayOrder = 999999
     local parent = (realGetHui and realGetHui()) or (gethui and gethui())
     if not parent then local ok2 = pcall(function() parent = game:GetService("CoreGui") end) end
     sg.Parent = parent or game:GetService("CoreGui")
+    -- protect the GUI from game-side enumeration where the executor supports it
+    pcall(function()
+      local pg = (syn and syn.protect_gui) or protectgui or protect_gui
+      if pg then pg(sg) end
+    end)
 
     local frame = Instance.new("Frame", sg)
     frame.Size = UDim2.fromOffset(440, 300)
@@ -261,17 +288,48 @@ end
 -- ============================================================================
 -- Hooks
 -- ============================================================================
+-- Depth-capped, cycle-safe serializer so RemoteEvent / exfil table args are fully
+-- revealed (e.g. {give="all", to="Attacker"}) instead of an opaque "{table}".
+local function ser(v, depth, seen)
+  local t = type(v)
+  if t == "string" then return '"' .. (#v > 120 and (v:sub(1, 120) .. "…") or v) .. '"'
+  elseif t == "number" or t == "boolean" or t == "nil" then return tostring(v)
+  elseif t == "function" then return "fn"
+  elseif t == "userdata" or t == "vector" then
+    local ok, full = pcall(function() return v.GetFullName and v:GetFullName() end)
+    return (ok and full) and ("<" .. full .. ">") or tostring(v)
+  elseif t == "table" then
+    if depth <= 0 then return "{…}" end
+    seen = seen or {}
+    if seen[v] then return "{cycle}" end
+    seen[v] = true
+    local parts, n = {}, 0
+    for k, val in pairs(v) do
+      n = n + 1
+      if n > 16 then parts[#parts + 1] = "…"; break end
+      parts[#parts + 1] = tostring(k) .. "=" .. ser(val, depth - 1, seen)
+    end
+    seen[v] = nil
+    return "{" .. table.concat(parts, ", ") .. "}"
+  end
+  return tostring(v)
+end
 local function summarizeArgs(args)
   local parts = {}
-  for i = 1, math.min(#args, 6) do
-    local a = args[i]
-    local t = type(a)
-    if t == "string" then parts[i] = '"' .. (a:sub(1, 48)) .. '"'
-    elseif t == "table" then parts[i] = "{table}"
-    elseif t == "userdata" then parts[i] = tostring(a)
-    else parts[i] = tostring(a) end
-  end
+  for i = 1, math.min(#args, 8) do parts[i] = ser(args[i], 3) end
   return table.concat(parts, ", ")
+end
+-- Attribute a call to the script / line that made it (defeats payload anonymity).
+local function whoCalled()
+  if realGetCallingScript then
+    local ok, sc = pcall(realGetCallingScript)
+    if ok and sc then local ok2, n = pcall(function() return sc:GetFullName() end); if ok2 and n then return n end end
+  end
+  if realDebugInfo then
+    local ok, src, line = pcall(realDebugInfo, 3, "sl")
+    if ok and src then return tostring(src) .. ":" .. tostring(line) end
+  end
+  return nil
 end
 
 local function logHttp(fn, url, method, body)
@@ -323,15 +381,17 @@ if realHookMeta and realNamecall then
         end
         local path = self.GetFullName and self:GetFullName() or tostring(self)
         if (method == "FireServer" or method == "fireServer") and F.remotes then
-          emit("remote", "high", "FireServer", path .. "(" .. summarizeArgs(args) .. ")", { path = path, args = summarizeArgs(args) })
+          emit("remote", "high", "FireServer", path .. "(" .. summarizeArgs(args) .. ")", { path = path, args = summarizeArgs(args), src = whoCalled() })
         elseif method == "InvokeServer" and F.remotes then
-          emit("remote", "high", "InvokeServer", path .. "(" .. summarizeArgs(args) .. ")", { path = path })
+          emit("remote", "high", "InvokeServer", path .. "(" .. summarizeArgs(args) .. ")", { path = path, args = summarizeArgs(args), src = whoCalled() })
         elseif (method == "Fire" or method == "Invoke") and F.remotes then
           emit("bindable", "med", method, path .. "(" .. summarizeArgs(args) .. ")")
         elseif (method == "HttpGet" or method == "HttpGetAsync") and F.http then
           logHttp("game:HttpGet", args[1], "GET")
         elseif (method == "HttpPost" or method == "HttpPostAsync") and F.http then
           logHttp("game:HttpPost", args[1], "POST", args[2])
+        elseif method == "JSONEncode" and F.crypt then
+          emit("encode", "med", "JSONEncode", ser(args[1], 3), { preview = ser(args[1], 4), src = whoCalled() })
         elseif (method == "GetService" or method == "service") and F.game then
           emit("game", "info", "GetService", tostring(args[1]))
         elseif (method == "FireClickDetector" or method == "FireProximityPrompt" or method == "FireTouchInterest") and F.game then
@@ -396,6 +456,77 @@ if F.persist and realQueueTeleport and realHookFunction then
     if not busy then emit("persist", "high", "queue_on_teleport", "#" .. #tostring(src) .. " bytes", { preview = tostring(src):sub(1, 2048) }) end
     return orig(src, ...)
   end))
+end
+
+-- WebSocket (C2 channel)
+if F.http and realWebSocket and realHookFunction then
+  local orig
+  orig = realHookFunction(realWebSocket, realNewCC(function(url, ...)
+    if not busy then
+      local tag = classify(tostring(url))
+      emit("websocket", tag and "high" or "med", "WebSocket.connect", tostring(url), { url = url, src = whoCalled() })
+    end
+    return orig(url, ...)
+  end))
+end
+
+-- memory / env scraping (hunting RemoteEvents & secrets, or re-hooking to detect us)
+if F.recon and realHookFunction then
+  local function reconSpy(name, fn)
+    if type(fn) ~= "function" then return end
+    local orig
+    orig = realHookFunction(fn, realNewCC(function(...)
+      if not busy then emit("recon", "med", name, "scans the running environment / GC", { src = whoCalled() }) end
+      return orig(...)
+    end))
+  end
+  reconSpy("getgc", realGetgc)
+  reconSpy("filtergc", realFiltergc)
+  reconSpy("getreg", realGetreg)
+  reconSpy("getrenv", realGetrenv)
+  reconSpy("getsenv", realGetsenv)
+  reconSpy("getrawmetatable", realGetRawMeta)
+end
+
+-- global signal-firing funcs (automated in-game actions — distinct from namecall)
+if F.game and realHookFunction then
+  local function fireSpy(name, fn)
+    if type(fn) ~= "function" then return end
+    local orig
+    orig = realHookFunction(fn, realNewCC(function(target, ...)
+      if not busy then
+        local p = "?"
+        pcall(function() p = (target and target.GetFullName) and target:GetFullName() or tostring(target) end)
+        emit("signal", "med", name, p, { src = whoCalled() })
+      end
+      return orig(target, ...)
+    end))
+  end
+  fireSpy("fireproximityprompt", realFireProx)
+  fireSpy("fireclickdetector", realFireClick)
+  fireSpy("firetouchinterest", realFireTouch)
+  fireSpy("firesignal", realFireSignal)
+end
+
+-- crypt / base64 (capturing in + out reveals exfil payloads & decoded configs)
+if F.crypt and realHookFunction then
+  local function cryptSpy(name, fn, kind)
+    if type(fn) ~= "function" then return end
+    local orig
+    orig = realHookFunction(fn, realNewCC(function(input, ...)
+      local out = orig(input, ...)
+      if not busy then
+        local inS = tostring(input)
+        local tag = classify(inS) or classify(tostring(out)) or bodyFlags(inS) or bodyFlags(tostring(out))
+        emit("crypt", tag and "high" or "med", name, kind .. " " .. inS:sub(1, 160), { input = inS:sub(1, 1024), output = tostring(out):sub(1, 1024), src = whoCalled() })
+      end
+      return out
+    end))
+  end
+  cryptSpy("base64decode", realB64dec, "decode")
+  cryptSpy("base64encode", realB64enc, "encode")
+  cryptSpy("crypt.decrypt", realCryptDec, "decrypt")
+  cryptSpy("crypt.encrypt", realCryptEnc, "encrypt")
 end
 
 emit("ready", "low", "logger", (realIdentify and ("on " .. tostring(select(1, pcall(realIdentify)) and realIdentify() or "executor")) or "ready") .. " — watching. Toggle GUI: " .. TOGGLE_KEY)
