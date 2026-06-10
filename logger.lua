@@ -89,9 +89,25 @@ local realWebSocket = (WebSocket and WebSocket.connect) or (websocket and websoc
 -- caller attribution
 local realDebugInfo = debug and debug.info
 local realGetCallingScript = getcallingscript
+-- anti-analysis probes (a script checking for / undoing our hooks is itself a signal)
+local realRestoreFn = restorefunction or hookrestore or restorefunc
+local realGetFnHash = getfunctionhash
+-- modern sUNC surface used for evasion / privilege / recon
+local realSetIdentity = setthreadidentity or setidentity or setthreadcontext
+local realCloneRef = cloneref
+local realGetConnections = getconnections
+local realGetBytecode = getscriptbytecode or dumpstring
+local realSetHiddenProp = sethiddenproperty
+-- the local player's identity, so exfil of it is detectable even by a different channel
+local LP_NAME, LP_ID, LP_DISPLAY
+pcall(function()
+  local lp = Players and Players.LocalPlayer
+  if lp then LP_NAME, LP_ID, LP_DISPLAY = lp.Name, tostring(lp.UserId), lp.DisplayName end
+end)
 
 local busy = false        -- reentrancy guard so the logger never logs itself
 local seq = 0
+local lastRemoteSig = nil -- dedup so a remote logged via __namecall isn't re-logged via its function hook
 local vt = 0
 local function now() vt = vt + 0.001 return vt end
 
@@ -115,6 +131,9 @@ local function bodyFlags(s)
   if type(s) ~= "string" then return nil end
   if string.find(s, "ROBLOSECURITY") then return "cookie", "high" end
   if string.find(string.lower(s), "hwid") then return "hwid", "high" end
+  -- P7: the body carries the local player's identity → exfil of who you are
+  if LP_NAME and #LP_NAME > 2 and string.find(s, LP_NAME, 1, true) then return "player-name", "high" end
+  if LP_ID and #LP_ID > 4 and string.find(s, LP_ID, 1, true) then return "player-id", "high" end
   return nil
 end
 
@@ -150,6 +169,12 @@ end
 
 local function emit(etype, severity, fn, detail, extra)
   if busy then return end
+  -- dedup: the colon call (remote:FireServer) is caught by __namecall; if the same
+  -- call also surfaces through the function hook (via="fn"), drop the duplicate.
+  if etype == "remote" then
+    if extra and extra.via == "fn" and detail == lastRemoteSig then return end
+    lastRemoteSig = detail
+  end
   busy = true
   seq = seq + 1
   local ev = { seq = seq, ts = now(), type = etype, severity = severity or "info", fn = fn, detail = detail }
@@ -167,7 +192,10 @@ end
 -- ============================================================================
 local function buildGui()
   local okGui, api = pcall(function()
-    local sg = Instance.new("ScreenGui")
+    -- modern Instance.new: never pass the deprecated 2nd (parent) arg
+    local inew = Instance.new
+    local function mk(class, parent) local o = inew(class); if parent then o.Parent = parent end; return o end
+    local sg = mk("ScreenGui")
     sg.Name = (HttpService and HttpService.GenerateGUID) and HttpService:GenerateGUID(false) or "\0"
     sg.ResetOnSpawn = false
     sg.IgnoreGuiInset = true
@@ -181,17 +209,17 @@ local function buildGui()
       if pg then pg(sg) end
     end)
 
-    local frame = Instance.new("Frame", sg)
+    local frame = mk("Frame", sg)
     frame.Size = UDim2.fromOffset(440, 300)
     frame.Position = UDim2.fromOffset(20, 80)
     frame.BackgroundColor3 = Color3.fromRGB(13, 14, 17)
     frame.BorderSizePixel = 0
     frame.Active = true
-    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
-    local stroke = Instance.new("UIStroke", frame)
+    mk("UICorner", frame).CornerRadius = UDim.new(0, 8)
+    local stroke = mk("UIStroke", frame)
     stroke.Color = Color3.fromRGB(38, 42, 49)
 
-    local bar = Instance.new("TextLabel", frame)
+    local bar = mk("TextLabel", frame)
     bar.Size = UDim2.new(1, 0, 0, 30)
     bar.BackgroundColor3 = Color3.fromRGB(21, 23, 28)
     bar.BorderSizePixel = 0
@@ -200,9 +228,9 @@ local function buildGui()
     bar.TextColor3 = Color3.fromRGB(52, 200, 184)
     bar.Text = "  SecureScripts — Luau Logger"
     bar.TextXAlignment = Enum.TextXAlignment.Left
-    Instance.new("UICorner", bar).CornerRadius = UDim.new(0, 8)
+    mk("UICorner", bar).CornerRadius = UDim.new(0, 8)
 
-    local count = Instance.new("TextLabel", bar)
+    local count = mk("TextLabel", bar)
     count.Size = UDim2.fromOffset(120, 30)
     count.Position = UDim2.new(1, -124, 0, 0)
     count.BackgroundTransparency = 1
@@ -212,7 +240,7 @@ local function buildGui()
     count.Text = "0 events"
     count.TextXAlignment = Enum.TextXAlignment.Right
 
-    local list = Instance.new("ScrollingFrame", frame)
+    local list = mk("ScrollingFrame", frame)
     list.Size = UDim2.new(1, -10, 1, -38)
     list.Position = UDim2.fromOffset(5, 34)
     list.BackgroundTransparency = 1
@@ -220,7 +248,7 @@ local function buildGui()
     list.ScrollBarThickness = 4
     list.CanvasSize = UDim2.new()
     list.AutomaticCanvasSize = Enum.AutomaticSize.Y
-    local layout = Instance.new("UIListLayout", list)
+    local layout = mk("UIListLayout", list)
     layout.Padding = UDim.new(0, 2)
 
     -- drag
@@ -252,7 +280,7 @@ local function buildGui()
       add = function(ev)
         n = n + 1
         count.Text = n .. " events"
-        local lbl = Instance.new("TextLabel", list)
+        local lbl = mk("TextLabel", list)
         lbl.Size = UDim2.new(1, -6, 0, 16)
         lbl.BackgroundTransparency = 1
         lbl.Font = Enum.Font.Code
@@ -332,10 +360,30 @@ local function whoCalled()
   return nil
 end
 
+-- P3: a Discord-webhook-shaped body — catches webhooks proxied through a
+-- non-Discord host (attacker VPS / Cloudflare worker) where the URL looks benign.
+local function looksLikeWebhookPayload(body)
+  if type(body) ~= "string" or #body < 8 then return false end
+  local low = string.lower(body)
+  if string.find(low, '"embeds"', 1, true) and (string.find(low, '"title"', 1, true) or string.find(low, '"fields"', 1, true) or string.find(low, '"description"', 1, true)) then return true end
+  if string.find(low, '"content"', 1, true) and (string.find(low, '"username"', 1, true) or string.find(low, '"avatar_url"', 1, true)) then return true end
+  return false
+end
+-- P6: an opaque, whitespace-free, high-base64-density blob — likely custom-encoded exfil.
+local function looksEncoded(body)
+  if type(body) ~= "string" or #body < 80 then return false end
+  if string.find(body, "[%s{}]") then return false end
+  local _, b64 = string.gsub(body, "[%w%+/=]", "")
+  return (b64 / #body) > 0.95
+end
+
 local function logHttp(fn, url, method, body)
   local tag, sev = classify(url)
   local bf, bsev = bodyFlags(body)
   if bf then sev = bsev end
+  local m = string.upper(tostring(method or "GET"))
+  if m == "POST" and looksLikeWebhookPayload(body) and tag ~= "webhook" then tag, sev = "proxied-webhook", "high" end
+  if m == "POST" and not tag and looksEncoded(body) then tag, sev = "encoded-payload", sev or "med" end
   local detail = (method or "GET") .. " " .. tostring(url)
   if tag then detail = "[" .. tag .. "] " .. detail end
   if bf then detail = detail .. "  (body has " .. bf .. ")" end
@@ -349,20 +397,32 @@ local function isRpc(url)
     or (string.find(string.lower(url), "discord") and string.find(url, "/rpc"))
 end
 
--- HTTP spy on the request family
-if F.http and realRequest and realHookFunction then
-  local origRequest
-  origRequest = realHookFunction(realRequest, realNewCC(function(opts, ...)
-    if type(opts) == "table" and not busy then
-      local url = opts.Url or opts.url
-      logHttp("request", url, opts.Method or opts.method or "GET", opts.Body or opts.body)
-      if BLOCK_RPC and isRpc(url) then
-        emit("block", "high", "request", "BLOCKED Discord RPC " .. tostring(url))
-        return { StatusCode = 403, StatusMessage = "Blocked", Success = false, Headers = {}, Body = "" }
+-- HTTP spy on the request family (P4: hook EVERY distinct alias, not just one)
+if F.http and realHookFunction then
+  local seenReq = {}
+  local function hookReq(fn)
+    if type(fn) ~= "function" or seenReq[fn] then return end
+    seenReq[fn] = true
+    local orig
+    orig = realHookFunction(fn, realNewCC(function(opts, ...)
+      if type(opts) == "table" and not busy then
+        local url = opts.Url or opts.url
+        -- never log our own stream POSTs to the local listener (would loop)
+        if not (ENDPOINT ~= "" and url and string.sub(tostring(url), 1, #ENDPOINT) == ENDPOINT) then
+          logHttp("request", url, opts.Method or opts.method or "GET", opts.Body or opts.body)
+          if BLOCK_RPC and isRpc(url) then
+            emit("block", "high", "request", "BLOCKED Discord RPC " .. tostring(url))
+            return { StatusCode = 403, StatusMessage = "Blocked", Success = false, Headers = {}, Body = "" }
+          end
+        end
       end
-    end
-    return origRequest(opts, ...)
-  end))
+      return orig(opts, ...)
+    end))
+  end
+  hookReq(request); hookReq(http_request)
+  hookReq(syn and syn.request); hookReq(http and http.request)
+  hookReq(fluxus and fluxus.request); hookReq(krnl and krnl.request)
+  hookReq(getgenv and getgenv().request)
 end
 
 -- __namecall: remotes, HttpGet, services, etc.
@@ -390,6 +450,13 @@ if realHookMeta and realNamecall then
           logHttp("game:HttpGet", args[1], "GET")
         elseif (method == "HttpPost" or method == "HttpPostAsync") and F.http then
           logHttp("game:HttpPost", args[1], "POST", args[2])
+        elseif method == "RequestAsync" and cls == "HttpService" and F.http then
+          local o = args[1]
+          if type(o) == "table" then logHttp("HttpService:RequestAsync", o.Url or o.url, o.Method or o.method or "GET", o.Body or o.body) end
+        elseif method == "GetAsync" and cls == "HttpService" and F.http then
+          logHttp("HttpService:GetAsync", args[1], "GET")
+        elseif method == "PostAsync" and cls == "HttpService" and F.http then
+          logHttp("HttpService:PostAsync", args[1], "POST", args[2])
         elseif method == "JSONEncode" and F.crypt then
           emit("encode", "med", "JSONEncode", ser(args[1], 3), { preview = ser(args[1], 4), src = whoCalled() })
         elseif (method == "GetService" or method == "service") and F.game then
@@ -401,6 +468,31 @@ if realHookMeta and realNamecall then
     end
     return origNamecall(self, ...)
   end))
+end
+
+-- P1: also hook FireServer/InvokeServer as FUNCTIONS, so the __index-cache bypass
+-- (local f = remote.FireServer; f(remote, ...)) can't skip the __namecall hook.
+-- The emit() dedup drops the duplicate when a colon call routes through both.
+if F.remotes and realHookFunction then
+  local function hookRemoteFn(className, methodName)
+    local ok, inst = pcall(Instance.new, className)
+    if not ok or not inst then return end
+    local ok2, fn = pcall(function() return inst[methodName] end)
+    if not ok2 or type(fn) ~= "function" then return end
+    local orig
+    orig = realHookFunction(fn, realNewCC(function(self, ...)
+      if not busy then
+        local a = { ... }
+        pcall(function()
+          local path = (self and self.GetFullName) and self:GetFullName() or tostring(self)
+          emit("remote", "high", methodName, path .. "(" .. summarizeArgs(a) .. ")", { path = path, args = summarizeArgs(a), src = whoCalled(), via = "fn" })
+        end)
+      end
+      return orig(self, ...)
+    end))
+  end
+  hookRemoteFn("RemoteEvent", "FireServer")
+  hookRemoteFn("RemoteFunction", "InvokeServer")
 end
 
 -- filesystem
@@ -486,6 +578,41 @@ if F.recon and realHookFunction then
   reconSpy("getrenv", realGetrenv)
   reconSpy("getsenv", realGetsenv)
   reconSpy("getrawmetatable", realGetRawMeta)
+end
+
+-- P5: anti-analysis — a script that UNDOES or FINGERPRINTS hooks is checking for us
+if F.recon and realHookFunction then
+  if type(realRestoreFn) == "function" then
+    local orig
+    orig = realHookFunction(realRestoreFn, realNewCC(function(...)
+      if not busy then emit("anti-analysis", "high", "restorefunction", "tries to UNDO a function hook", { src = whoCalled() }) end
+      return orig(...)
+    end))
+  end
+  if type(realGetFnHash) == "function" then
+    local orig
+    orig = realHookFunction(realGetFnHash, realNewCC(function(...)
+      if not busy then emit("anti-analysis", "med", "getfunctionhash", "fingerprints a function (hook check)", { src = whoCalled() }) end
+      return orig(...)
+    end))
+  end
+end
+
+-- modern sUNC recon / anti-analysis surface (identity spoofing, ref-cloning, etc.)
+if F.recon and realHookFunction then
+  local function probe(name, fn, sev, note)
+    if type(fn) ~= "function" then return end
+    local orig
+    orig = realHookFunction(fn, realNewCC(function(...)
+      if not busy then emit("anti-analysis", sev, name, note, { src = whoCalled() }) end
+      return orig(...)
+    end))
+  end
+  probe("setthreadidentity", realSetIdentity, "high", "spoofs thread identity (checkcaller / privilege)")
+  probe("cloneref", realCloneRef, "med", "clones a ref to dodge hook / identity checks")
+  probe("getconnections", realGetConnections, "med", "enumerates signal connections (disconnect AC / find remotes)")
+  probe("getscriptbytecode", realGetBytecode, "med", "dumps script bytecode (recon / theft)")
+  probe("sethiddenproperty", realSetHiddenProp, "med", "writes a hidden property")
 end
 
 -- global signal-firing funcs (automated in-game actions — distinct from namecall)
