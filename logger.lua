@@ -28,10 +28,24 @@ local BLOCK_RPC = CFG.blockRPC ~= false      -- default true
 local ENDPOINT = CFG.endpoint or ""           -- "" disables streaming to the app
 local TOKEN = CFG.streamToken or ""           -- anti-spoof token for the local listener
 local TOGGLE_KEY = CFG.toggleKey or "RightShift"
+local AUTODECODE = CFG.autoDecode ~= false    -- decode application/json response bodies
+
+-- User-supplied URL blocklist (substring match) — ported from HttpSpy's BlockedURLs.
+-- A matching request is dropped with a 403-shaped table and never hits the network.
+local BLOCKLIST = {}
+do
+  local src = CFG.blockedURLs or CFG.BlockedURLs
+  if type(src) == "table" then
+    for _, u in pairs(src) do
+      if type(u) == "string" and u ~= "" then BLOCKLIST[#BLOCKLIST + 1] = u end
+    end
+  end
+end
 
 -- per-feature global toggles (all default ON)
 local F = {
   http        = CFG.httpLogger ~= false,
+  responses   = CFG.responseLogger ~= false,
   remotes     = CFG.remoteLogger ~= false,
   fs          = CFG.fsLogger ~= false,
   loadstrings = CFG.loadstringLogger ~= false,
@@ -377,18 +391,73 @@ local function looksEncoded(body)
   return (b64 / #body) > 0.95
 end
 
-local function logHttp(fn, url, method, body)
+-- A request *carrying* the session cookie / HWID / player identity in its headers
+-- or Cookies field is a smoking-gun exfil that a plain URL+body view would miss.
+local function headerFlag(headers, cookies)
+  if type(headers) == "table" then
+    for _, v in pairs(headers) do
+      if type(v) == "string" then local f = bodyFlags(v); if f then return f end end
+    end
+  end
+  if type(cookies) == "string" then return bodyFlags(cookies) end
+  return nil
+end
+
+local function logHttp(fn, url, method, body, headers, cookies)
   local tag, sev = classify(url)
   local bf, bsev = bodyFlags(body)
   if bf then sev = bsev end
   local m = string.upper(tostring(method or "GET"))
   if m == "POST" and looksLikeWebhookPayload(body) and tag ~= "webhook" then tag, sev = "proxied-webhook", "high" end
   if m == "POST" and not tag and looksEncoded(body) then tag, sev = "encoded-payload", sev or "med" end
+  local hf = headerFlag(headers, cookies)
+  if hf then tag, sev = tag or (hf .. "-header"), "high" end
   local detail = (method or "GET") .. " " .. tostring(url)
   if tag then detail = "[" .. tag .. "] " .. detail end
   if bf then detail = detail .. "  (body has " .. bf .. ")" end
-  emit("http", sev or "med", fn, detail, { url = url, method = method, body = body and tostring(body):sub(1, 4096), flag = tag or bf })
+  if hf then detail = detail .. "  (header has " .. hf .. ")" end
+  emit("http", sev or "med", fn, detail, { url = url, method = method, body = body and tostring(body):sub(1, 4096), flag = tag or bf or hf })
   return tag
+end
+
+-- Ported from HttpSpy's response view: capture each request's response, decode
+-- application/json (case-insensitive content-type + nil-safe — fixes HttpSpy's
+-- exact-case "Content-Type" crash), and flag it. reqTag is the request's own
+-- classification (webhook / raw-ip / …) so a flagged request that gets a 2xx is
+-- surfaced as "exfil delivered".
+local function logResponse(url, reqTag, resp)
+  if type(resp) ~= "table" or busy then return end
+  local status = tonumber(resp.StatusCode or resp.Status or resp.status_code or resp.statusCode)
+  local headers = resp.Headers or resp.headers
+  local body = resp.Body or resp.body
+  local decoded
+  if AUTODECODE and HttpService and type(body) == "string" and #body <= 200000 and type(headers) == "table" then
+    local ct
+    for k, v in pairs(headers) do
+      if type(k) == "string" and string.lower(k) == "content-type" then ct = tostring(v); break end
+    end
+    if ct and string.find(string.lower(ct), "application/json", 1, true) then
+      busy = true
+      local ok, res = pcall(function() return HttpService:JSONDecode(body) end)
+      busy = false
+      if ok then decoded = res end
+    end
+  end
+  local sev, tag = "info", nil
+  local bf = bodyFlags(type(body) == "string" and body or nil)
+  if bf then sev, tag = "high", bf .. "-in-response" end
+  if reqTag and status and status >= 200 and status < 300 then
+    tag = tag or (reqTag .. "-ack")
+    if sev == "info" then
+      sev = (reqTag == "webhook" or reqTag == "proxied-webhook" or reqTag == "raw-ip") and "high" or "med"
+    end
+  end
+  local preview = ""
+  if decoded ~= nil then preview = ser(decoded, 4)
+  elseif type(body) == "string" then preview = (#body > 400 and (body:sub(1, 400) .. "…") or body) end
+  emit("response", sev, "request",
+    "<- " .. tostring(status or "?") .. (tag and ("  [" .. tag .. "]") or "") .. (preview ~= "" and ("  " .. preview) or ""),
+    { url = url, status = status, flag = tag, body = type(body) == "string" and body:sub(1, 4096) or nil, decoded = decoded ~= nil or nil })
 end
 
 local function isRpc(url)
@@ -397,7 +466,18 @@ local function isRpc(url)
     or (string.find(string.lower(url), "discord") and string.find(url, "/rpc"))
 end
 
--- HTTP spy on the request family (P4: hook EVERY distinct alias, not just one)
+local function isBlocked(url)
+  if type(url) ~= "string" or #BLOCKLIST == 0 then return false end
+  for _, b in ipairs(BLOCKLIST) do
+    if string.find(url, b, 1, true) then return true end
+  end
+  return false
+end
+
+-- HTTP spy on the request family (P4: hook EVERY distinct alias, not just one).
+-- Ported from HttpSpy: also capture + decode the RESPONSE — but without its
+-- coroutine dance. We reuse the single orig() call the hook already makes and keep
+-- its result, so there's no extra request and nothing new for a script to detect.
 if F.http and realHookFunction then
   local seenReq = {}
   local function hookReq(fn)
@@ -405,18 +485,30 @@ if F.http and realHookFunction then
     seenReq[fn] = true
     local orig
     orig = realHookFunction(fn, realNewCC(function(opts, ...)
+      local logged, url, reqTag = false, nil, nil
       if type(opts) == "table" and not busy then
-        local url = opts.Url or opts.url
+        url = opts.Url or opts.url
         -- never log our own stream POSTs to the local listener (would loop)
         if not (ENDPOINT ~= "" and url and string.sub(tostring(url), 1, #ENDPOINT) == ENDPOINT) then
-          logHttp("request", url, opts.Method or opts.method or "GET", opts.Body or opts.body)
+          logged = true
+          reqTag = logHttp("request", url, opts.Method or opts.method or "GET", opts.Body or opts.body,
+            opts.Headers or opts.headers, opts.Cookies or opts.cookies)
           if BLOCK_RPC and isRpc(url) then
             emit("block", "high", "request", "BLOCKED Discord RPC " .. tostring(url))
             return { StatusCode = 403, StatusMessage = "Blocked", Success = false, Headers = {}, Body = "" }
           end
+          if isBlocked(url) then
+            emit("block", "high", "request", "BLOCKED " .. tostring(url) .. " (blocklist)")
+            return { StatusCode = 403, StatusMessage = "Blocked by SecureScripts", Success = false, Headers = {}, Body = "" }
+          end
         end
       end
-      return orig(opts, ...)
+      -- not capturing responses: behave exactly as before (single tail call)
+      if not (F.responses and logged) then return orig(opts, ...) end
+      -- capturing: reuse the one orig() call, keep the response, log it, return it
+      local resp = orig(opts, ...)
+      pcall(logResponse, url, reqTag, resp)
+      return resp
     end))
   end
   hookReq(request); hookReq(http_request)
@@ -448,6 +540,8 @@ if realHookMeta and realNamecall then
           emit("bindable", "med", method, path .. "(" .. summarizeArgs(args) .. ")")
         elseif (method == "HttpGet" or method == "HttpGetAsync") and F.http then
           logHttp("game:HttpGet", args[1], "GET")
+        elseif method == "GetObjects" and F.http then
+          logHttp("game:GetObjects", args[1], "GET")
         elseif (method == "HttpPost" or method == "HttpPostAsync") and F.http then
           logHttp("game:HttpPost", args[1], "POST", args[2])
         elseif method == "RequestAsync" and cls == "HttpService" and F.http then
