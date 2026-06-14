@@ -54,6 +54,7 @@ local F = {
   game        = CFG.gameLogger ~= false,
   recon       = CFG.reconLogger ~= false,
   crypt       = CFG.cryptLogger ~= false,
+  vmdump      = CFG.vmDumpLogger ~= false,   -- table.concat constant dump (VM obfuscators)
 }
 
 -- dangerous service methods executors block (Myriad blocklist) — flag by category
@@ -748,6 +749,69 @@ if F.crypt and realHookFunction then
   cryptSpy("base64encode", realB64enc, "encode")
   cryptSpy("crypt.decrypt", realCryptDec, "decrypt")
   cryptSpy("crypt.encrypt", realCryptEnc, "encrypt")
+end
+
+-- VM constant dump (table.concat) — bytecode-VM obfuscators (PSU / IronBrew /
+-- Luraph / MoonSec) keep their real strings encoded and only rebuild them at
+-- runtime, almost always by table.concat-ing a freshly-decoded byte/char array.
+-- Hooking table.concat and surfacing the results that look like real Lua source
+-- or network IOCs exposes the payload the VM otherwise hides. Unlike our offline
+-- scan this WORKS, because the decode runs in a genuine executor env where the
+-- env-sensitive values come back non-nil instead of corrupting into base85 noise —
+-- it's the one reliable read we have on these families. table.concat is the choke
+-- point: even a constant cached as `local c = table.concat` before we load still
+-- routes through the hook, since hookfunction patches the closure object itself.
+if F.vmdump and realHookFunction and type(table) == "table" and type(table.concat) == "function" then
+  pcall(function()
+    -- tell a DECODED constant blob (real source / IOCs) from ordinary concat noise
+    -- (UI text, still-encoded base85/base64 chunks). All scans are plain-string
+    -- (Boyer–Moore in C) and run on a bounded head+tail probe, never the whole blob.
+    local function looksDecoded(s)
+      if string.find(s, "loadstring", 1, true) then return "loadstring" end
+      if string.find(s, "GetService", 1, true) then return "GetService" end
+      if string.find(s, "FireServer", 1, true) or string.find(s, "InvokeServer", 1, true) then return "remote" end
+      if string.find(s, "HttpGet", 1, true) or string.find(s, "HttpPost", 1, true) then return "http" end
+      if string.find(s, "://", 1, true) and (string.find(s, "http", 1, true) or string.find(s, "discord", 1, true)) then return "url" end
+      if string.find(s, "function", 1, true) and string.find(s, "end", 1, true) then return "lua-source" end
+      if string.find(s, "local ", 1, true) and string.find(s, "=", 1, true) then return "lua-source" end
+      return nil
+    end
+    local seenBlob, blobCount, budget, inConcat = {}, 0, 20000, false
+    local origConcat
+    origConcat = realHookFunction(table.concat, realNewCC(function(...)
+      local out = origConcat(...)
+      -- fast path: skip our own concats (busy), re-entry, exhausted budget, and tiny joins
+      if (not inConcat) and (not busy) and F.vmdump and budget > 0 and type(out) == "string" then
+        local n = #out
+        if n >= 24 then
+          inConcat = true
+          budget = budget - 1
+          pcall(function()
+            -- only ever scan/serialize a bounded slice, no matter how big the blob
+            local probe = out
+            if n > 20480 then probe = string.sub(out, 1, 16384) .. "\n" .. string.sub(out, n - 4096) end
+            local tag = looksDecoded(probe)
+            local ctag, csev = classify(probe)   -- reuse: webhook / raw-ip / workers.dev / paste / file:// / roblox-api
+            if tag or ctag then
+              local sig = n .. "|" .. string.sub(out, 1, 48)   -- dedup VM loops re-concatenating the same constant
+              if (not seenBlob[sig]) and blobCount < 80 then
+                seenBlob[sig] = true
+                blobCount = blobCount + 1
+                local label = ctag or tag
+                local bf = bodyFlags(probe)
+                local hi = bf or csev == "high" or tag == "url" or tag == "http" or tag == "remote" or tag == "loadstring"
+                emit("vmdump", hi and "high" or "med", "table.concat",
+                  "decoded VM constant (" .. label .. (bf and (", " .. bf) or "") .. ", " .. n .. "b)",
+                  { tag = label, bytes = n, preview = string.sub(out, 1, 4096), src = whoCalled() })
+              end
+            end
+          end)
+          inConcat = false
+        end
+      end
+      return out
+    end))
+  end)
 end
 
 emit("ready", "low", "logger", (realIdentify and ("on " .. tostring(select(1, pcall(realIdentify)) and realIdentify() or "executor")) or "ready") .. " — watching. Toggle GUI: " .. TOGGLE_KEY)
